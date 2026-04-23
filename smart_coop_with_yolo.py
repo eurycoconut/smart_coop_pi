@@ -407,20 +407,6 @@ def update_door_state(new_state, reason="manual"):
     except Exception as e:
         debug_log(f"Door update error: {e}", "ERROR")
 
-def check_manual_snapshot_request():
-    """Check if app requested snapshot"""
-    if firebase_db is None:
-        return False
-    try:
-        command = firebase_db.child('camera/command').get()
-        if command == 'capture':
-            firebase_db.child('camera/command').delete()
-            debug_log("📸 Manual snapshot requested from app", "INFO")
-            return True
-    except Exception as e:
-        debug_log(f"Error checking snapshot command: {e}", "ERROR")
-    return False
-
 # ==================== CAMERA FUNCTIONS ====================
 def capture_snapshot_frame():
     """Capture frame specifically for snapshots with retries"""
@@ -435,7 +421,7 @@ def capture_snapshot_frame():
             with camera_lock:
                 for _ in range(3):
                     camera.grab()
-                ret, frame = camera.retrieve()
+                ret, frame = camera.read()
                 
                 if ret and frame is not None:
                     h, w = frame.shape[:2]
@@ -702,24 +688,6 @@ def detection_loop():
     
     last_detection_time = current_time
     
-    # Check for manual snapshot request
-    if check_manual_snapshot_request():
-        print("\n" + "="*70)
-        print("📸 MANUAL SNAPSHOT REQUESTED")
-        print("="*70)
-        
-        frame = capture_snapshot_frame()
-        
-        if frame is not None:
-            snapshot_id = upload_manual_snapshot(frame)
-            if snapshot_id:
-                print("✓ Snapshot captured and uploaded successfully!")
-            else:
-                print("✗ Snapshot upload failed")
-        else:
-            print("✗ Snapshot capture failed")
-        
-        print("="*70 + "\n")
     
     # Regular detection
     frame = capture_frame()
@@ -832,6 +800,52 @@ def sensor_loop():
             debug_log(f"Sensor loop error: {e}", "ERROR")
             time.sleep(5)
 
+def snapshot_listener_loop():
+    """
+    NEW: Dedicated listener for Flutter capture commands
+    FIX: Removes dependency on detection_loop timing
+    """
+    global firebase_db
+
+    while stream_active:
+        try:
+            if firebase_db is None:
+                time.sleep(1)
+                continue
+
+            command = firebase_db.child('camera/command').get()
+
+            # SUPPORT BOTH formats: "capture" OR {"action":"capture"}
+            should_capture = False
+
+            if command == "capture":
+                should_capture = True
+
+            elif isinstance(command, dict) and command.get("action") == "capture":
+                should_capture = True
+
+            if should_capture:
+                debug_log("📸 Capture command received from app", "INFO")
+
+                # CLEAR command immediately (IMPORTANT FIX)
+                firebase_db.child('camera/command').delete()
+
+                frame = capture_snapshot_frame()
+
+                if frame is not None:
+                    snapshot_id = upload_manual_snapshot(frame)
+                    if snapshot_id:
+                        debug_log(f"Snapshot uploaded: {snapshot_id}", "INFO")
+                    else:
+                        debug_log("Upload failed", "ERROR")
+                else:
+                    debug_log("Camera capture failed", "ERROR")
+
+        except Exception as e:
+            debug_log(f"Snapshot listener error: {e}", "ERROR")
+
+        time.sleep(0.5)  # FAST polling (important)
+
 def detection_thread():
     time.sleep(2)
     while stream_active:
@@ -891,11 +905,21 @@ def main():
         sensor_thread = threading.Thread(target=sensor_loop, daemon=True)
         sensor_thread.start()
         print("[✓] Sensor monitoring started")
+
+       
         
         if yolo_ok:
             detect_thread = threading.Thread(target=detection_thread, daemon=True)
             detect_thread.start()
             print("[✓] Detection thread started")
+
+        snapshot_thread = threading.Thread(
+            target=snapshot_listener_loop,
+            daemon=True
+        )
+        snapshot_thread.start()
+
+        print("[✓] Snapshot listener started")
         
         if FLASK_AVAILABLE and camera_ok:
             run_flask()
